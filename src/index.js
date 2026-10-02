@@ -1,424 +1,192 @@
-// dsh-chameleon workbench-session-delete: delete-session capability (Host half).
-//
-// Deletes one session end-to-end on the host:
-//   POST /__chameleon/session/delete  - HTTP endpoint for the client button
-//   workbench_session_delete          - model tool for edit mode
-//
-// Deletion steps, kept consistent with the LIVE storage services so the
-// in-memory state and the on-disk units stay in sync (no "resurrected"
-// session after the next periodic flush):
-//   1. refuse while a live agent owns the session (ctx.agents.get(id));
-//   2. flush a live session so dispose-time teardown has no pending writes;
-//   3. remove the persisted log dir  ~/.dsh/sessions/<slug>/<id>/ for both id
-//      spellings (raw uuid and `session-` prefixed);
-//   4. drop the projection-cache row (storageDomain 'session_projcache',
-//      table 'sessions');
-//   5. only after the log is confirmed gone, remove the workspace accounting
-//      (domain 'workspace': sessionIds arrays + global.archivedSessionIds).
-//
-// The client reloads after a successful delete, so the fresh session list is
-// re-fetched from the host (session-query reads the persisted dirs).
-//
-// ESM module format (cordis bundle rule): named exports apply/inject/name.
-// All registrations belong to the plugin fiber (ctx.effect / disposers).
-import fs from 'node:fs'
+import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 
-const name = 'chameleon-session-delete'
-// Only `tools` is a hard dependency; webServer is optional (see apply).
-const inject = ['tools']
+export const name = 'gunthe-session-delete'
+export const inject = ['sessionPersistence', 'sessionProjectionCache', 'workspaceRegistry', 'connection']
 
-const SESSION_ID_RE = /^(session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const API_PATH = '/api/gunthe-session-delete/delete'
+const CSRF_HEADER = 'x-gunthe-plugin'
+const CSRF_VALUE = 'session-delete'
+const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$/
+const inFlight = new Map()
 
-class DeleteError extends Error {
-  constructor(message, status) {
-    super(message)
-    this.status = status
+export class DeleteError extends Error {
+  constructor(message, status = 500, code = 'DELETE_FAILED', details) {
+    super(message); this.status = status; this.code = code; this.details = details
   }
 }
 
-// --- path helpers ------------------------------------------------------------
+const dshHome = () => process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+const tombstoneRoot = () => path.join(dshHome(), 'session-delete-tombstones')
 
-function dshHome() {
-  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+export function validateSessionId(value) {
+  const id = String(value || '').trim()
+  if (!SAFE_SESSION_ID.test(id) || id === '.' || id === '..') throw new DeleteError('Invalid session ID.', 400, 'INVALID_SESSION_ID')
+  return id
 }
 
-function sessionsRoot() {
-  return path.join(dshHome(), 'sessions')
-}
-
-// Session ids may appear in two spellings in different stores: the raw id
-// (`<uuid>`) and the prefixed form (`session-<uuid>`).  The on-disk JSONL
-// backend encodes the exact session id, while older/workspace/projcache rows
-// can carry either spelling.  Return every unique spelling we should clean up.
-function sessionIdVariants(sessionId) {
-  const variants = new Set([sessionId])
-  if (sessionId.startsWith('session-')) {
-    variants.add(sessionId.slice('session-'.length))
-  } else if (SESSION_ID_RE.test(sessionId)) {
-    variants.add(`session-${sessionId}`)
+function trackerState(persistence, id) {
+  const tracker = persistence?.tracker
+  return {
+    writerHeld: tracker?.writers?.has?.(id) === true,
+    pending: tracker?.pending?.has?.(id) === true,
+    handles: [...(tracker?.openHandles ?? [])].filter((handle) => handle?.id === id),
   }
-  return [...variants]
 }
 
-// Locate ~/.dsh/sessions/<slug>/<sessionId>/ by scanning every slug dir, so
-// the workspace-path encoding never has to be re-derived here.  Returns every
-// matching directory (both id spellings, if both exist).
-function findSessionDirs(sessionId) {
-  const root = sessionsRoot()
-  const variants = sessionIdVariants(sessionId)
-  let entries = []
+function liveState(ctx, id) {
+  const agents = ctx.get?.('agents'); const sessions = ctx.get?.('sessions')
+  return {
+    agent: typeof agents?.get === 'function' ? agents.get(id) : undefined,
+    session: typeof sessions?.get === 'function' ? sessions.get(id) : undefined,
+  }
+}
+
+async function assertInactive(ctx, id) {
+  const activity = await ctx.waterfall?.('workspace/session-activity', { sessionId: id }, () => Promise.resolve([])) ?? []
+  const live = liveState(ctx, id); const tracker = trackerState(ctx.sessionPersistence, id)
+  if (activity.length || live.agent || live.session || tracker.writerHeld || tracker.pending || tracker.handles.length) {
+    throw new DeleteError('Session is active or held by Gunthe. Archive it, restart Gunthe, and delete it before reopening.', 409, 'SESSION_ACTIVE', { activityCount: activity.length, openHandles: tracker.handles.length })
+  }
+}
+
+async function writeAtomicJson(file, value) {
+  await fs.mkdir(path.dirname(file), { recursive: true })
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`
+  await fs.writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+  await fs.rename(temp, file)
+}
+
+async function loadTombstone(id) {
+  const file = path.join(tombstoneRoot(), `${id}.json`)
+  try { return { file, value: JSON.parse(await fs.readFile(file, 'utf8')) } }
+  catch (error) { if (error?.code === 'ENOENT') return { file, value: undefined }; throw error }
+}
+
+async function saveTombstone(file, value) {
+  const next = { ...value, updatedAt: new Date().toISOString() }
+  await writeAtomicJson(file, next); return next
+}
+
+async function verifyArtifact(persistence, file, expectedId) {
+  if (!/\.jsonl(?:\.zstd)?$/i.test(file)) throw new DeleteError('Unsupported session artifact.', 409, 'UNSUPPORTED_ARTIFACT')
+  if (typeof persistence.readStoredLog !== 'function') throw new DeleteError('Persistence validation API is unavailable.', 500, 'PERSISTENCE_API_UNAVAILABLE')
   try {
-    entries = fs.readdirSync(root, { withFileTypes: true })
-  } catch {
-    return []
+    const stored = await persistence.readStoredLog(file, expectedId)
+    if (stored?.meta?.id !== expectedId && stored?.header?.id !== expectedId) throw new DeleteError('Stored header ID does not match the selected session.', 409, 'HEADER_MISMATCH')
+  } catch (error) {
+    if (error instanceof DeleteError) throw error
+    throw new DeleteError(`Session artifact validation failed: ${error?.message ?? String(error)}`, 409, 'HEADER_MISMATCH')
   }
-  const found = []
-  for (const e of entries) {
-    if (!e.isDirectory()) continue
-    for (const variant of variants) {
-      const candidate = path.join(root, e.name, variant)
-      try {
-        if (fs.statSync(candidate).isDirectory() && !found.includes(candidate)) found.push(candidate)
-      } catch { /* keep scanning */ }
-    }
-  }
-  return found
 }
 
-// Remove every on-disk session directory for both id spellings.
-function removeSessionDirs(sessionId) {
-  const dirs = findSessionDirs(sessionId)
-  for (const dir of dirs) {
-    fs.rmSync(dir, { recursive: true, force: true })
-  }
-  return dirs.length > 0
+async function resolveSessionDirectory(persistence, id) {
+  const log = await persistence.resolveCurrentLog?.(id)
+  if (!log) throw new DeleteError('Session artifact was not found.', 404, 'SESSION_NOT_FOUND')
+  const absolute = path.resolve(log); await verifyArtifact(persistence, absolute, id)
+  const directory = path.dirname(absolute); const info = await fs.lstat(directory)
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new DeleteError('Unsafe session directory.', 409, 'UNSAFE_PATH')
+  const realRoot = await fs.realpath(path.resolve(dshHome(), 'sessions')); const realDirectory = await fs.realpath(directory)
+  if (!realDirectory.startsWith(`${realRoot}${path.sep}`)) throw new DeleteError('Session directory escaped the storage root.', 409, 'UNSAFE_PATH')
+  const realLog = await fs.realpath(absolute)
+  if (path.dirname(realLog) !== realDirectory) throw new DeleteError('Session artifact escaped its directory.', 409, 'UNSAFE_PATH')
+  return { log: realLog, directory: realDirectory }
 }
 
-// --- live storage mutation (memory + disk stay consistent) -------------------
-
-// Remove the session from the projection-cache domain and (optionally) the
-// workspace accounting domain. Uses the opened domain facilities (the
-// authoritative in-memory state) so the periodic flush can never re-publish a
-// stale row.  All id spellings are cleaned because projcache/workspace rows
-// may use either the raw uuid or the `session-` prefixed form.
-// Domain API: storageDomain.get(name) -> domain with .table(name) (KvTable:
-// get/put/delete/entries) and .global (handle with get/set).
-async function stripStorageDomains(ctx, sessionId, { workspace = true } = {}) {
-  const sd = ctx.get('storageDomain')
-  if (!sd) return { projRemoved: false, workspaceRemoved: false }
-  const variants = sessionIdVariants(sessionId)
-  let projRemoved = false
-  let workspaceRemoved = false
-
-  const proj = sd.get('session_projcache')
-  if (proj && typeof proj.table === 'function') {
-    try {
-      const sessions = proj.table('sessions')
-      for (const variant of variants) {
-        if (sessions.get(variant) !== undefined) {
-          await sessions.delete(variant)
-          projRemoved = true
-        }
-      }
-    } catch { /* unit closed or table absent: nothing to clean */ }
-  }
-
-  if (workspace) {
-    const ws = sd.get('workspace')
-    if (ws && typeof ws.table === 'function') {
-      try {
-        const workspaces = ws.table('workspaces')
-        for (const [wid, rec] of workspaces.entries()) {
-          if (rec && Array.isArray(rec.sessionIds) && variants.some((v) => rec.sessionIds.includes(v))) {
-            await workspaces.put(wid, {
-              ...rec,
-              sessionIds: rec.sessionIds.filter((x) => !variants.includes(x)),
-            })
-            workspaceRemoved = true
-          }
-        }
-      } catch { /* unit closed or table absent */ }
-      try {
-        const g = ws.global
-        if (g && typeof g.get === 'function' && typeof g.set === 'function') {
-          const state = g.get()
-          if (state && Array.isArray(state.archivedSessionIds) && variants.some((v) => state.archivedSessionIds.includes(v))) {
-            await g.set({ ...state, archivedSessionIds: state.archivedSessionIds.filter((x) => !variants.includes(x)) })
-            workspaceRemoved = true
-          }
-        }
-      } catch { /* no global slot or unit closed */ }
-    }
-  }
-
-  return { projRemoved, workspaceRemoved }
+async function removeProjection(cache, id) {
+  const table = typeof cache?.requireTable === 'function' ? cache.requireTable() : cache?.table
+  if (!table?.delete) throw new DeleteError('Projection cache removal is unavailable.', 500, 'PROJECTION_API_UNAVAILABLE')
+  await table.delete(id)
 }
 
-// --- core delete --------------------------------------------------------------
-
-// Stop a live agent (cancel the active turn, wait for quiescence) before its
-// session is deleted. Cancel causes surface in the log as a user-cancel; the
-// wait is time-boxed so a stuck driver never blocks the deletion.
-async function stopAgentIfRunning(ctx, sessionId) {
-  const agents = ctx.get('agents')
-  if (!agents || typeof agents.get !== 'function') return false
-  const agent = agents.get(sessionId)
-  if (!agent) return false
-  if (typeof agent.cancel === 'function') {
-    try { agent.cancel({ kind: 'user' }) } catch { /* agent may already be settling */ }
-  }
-  if (typeof agent.whenIdle === 'function') {
-    try {
-      await Promise.race([
-        agent.whenIdle(),
-        new Promise((resolve) => setTimeout(resolve, 15000)),
-      ])
-    } catch { /* ignore: proceed with deletion anyway */ }
-  }
-  return true
+async function cleanWorkspace(registry, id) {
+  for (const workspace of registry.list?.() ?? []) if (workspace.sessionIds?.includes(id)) await workspace.detachSession(id)
+  if (registry.archivedSessionIds?.includes(id)) await registry.unarchiveSession(id)
+  if (registry.pinnedSessionIds?.includes(id)) await registry.unpinSession(id)
 }
 
-// Flush a live session before detaching it.  The persistence layer flushes on
-// session/disposed; flushing here first drains any pending writes while the
-// session is still alive, so the later dispose has nothing to re-create after
-// we delete the on-disk log.
-async function flushSessionIfLive(ctx, sessionId) {
-  const sessions = ctx.get('sessions')
-  if (!sessions || typeof sessions.get !== 'function') return false
-  let flushed = false
-  for (const variant of sessionIdVariants(sessionId)) {
-    const session = sessions.get(variant)
-    if (!session) continue
-    if (typeof sessions.flush === 'function') {
-      try {
-        await sessions.flush(session)
-        flushed = true
-      } catch { /* ignore: deletion proceeds and removes the log anyway */ }
-    }
+async function assertTombstoneArtifactSafe(artifact, filesAlreadyRemoved) {
+  if (!artifact || typeof artifact.directory !== 'string' || typeof artifact.log !== 'string') throw new DeleteError('Invalid deletion tombstone path.', 409, 'INVALID_TOMBSTONE')
+  const root = path.resolve(dshHome(), 'sessions')
+  const realRoot = await fs.realpath(root)
+  const directory = path.resolve(artifact.directory)
+  const relative = path.relative(realRoot, directory)
+  const logDirectory = path.dirname(path.resolve(artifact.log))
+  if (relative.startsWith('..') || path.isAbsolute(relative) || path.relative(directory, logDirectory) !== '') throw new DeleteError('Deletion tombstone escaped the storage root.', 409, 'INVALID_TOMBSTONE')
+  if (!filesAlreadyRemoved) {
+    const info = await fs.lstat(directory)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new DeleteError('Unsafe tombstone directory.', 409, 'INVALID_TOMBSTONE')
+    const realDirectory = await fs.realpath(directory)
+    if (!realDirectory.startsWith(`${realRoot}${path.sep}`)) throw new DeleteError('Tombstone directory escaped the storage root.', 409, 'INVALID_TOMBSTONE')
   }
-  return flushed
 }
 
-// Remove the session from the in-memory store so host session lists stop
-// returning it and no flush can re-materialize its files. The store has no
-// public remove API; detachEntered is the store's own teardown path (deletes
-// the entry and emits session/disposed). Try every id spelling defensively.
-function detachLiveSession(ctx, sessionId) {
-  const sessions = ctx.get('sessions')
-  if (!sessions) return false
-  let detached = false
+async function runDelete(ctx, id) {
+  const prior = await loadTombstone(id)
+  let tombstone = prior.value
+  if (!tombstone) {
+    if (!ctx.workspaceRegistry.archivedSessionIds?.includes(id)) throw new DeleteError('Archive the session before permanently deleting it.', 409, 'ARCHIVE_REQUIRED')
+    await assertInactive(ctx, id)
+    const stored = await ctx.sessionPersistence.stat(id)
+    if (!stored) throw new DeleteError('Session was not found.', 404, 'SESSION_NOT_FOUND')
+    if (stored.header?.id !== id) throw new DeleteError('Persistence identity mismatch.', 409, 'HEADER_MISMATCH')
+    const artifact = await resolveSessionDirectory(ctx.sessionPersistence, id)
+    tombstone = await saveTombstone(prior.file, { schema: 'gunthe-session-delete/v1', sessionId: id, createdAt: new Date().toISOString(), artifact, steps: { files: false, projection: false, workspace: false } })
+  } else if (tombstone.sessionId !== id || tombstone.schema !== 'gunthe-session-delete/v1') {
+    throw new DeleteError('Invalid deletion tombstone.', 409, 'INVALID_TOMBSTONE')
+  }
+  const artifact = tombstone.artifact
+  await assertTombstoneArtifactSafe(artifact, tombstone.steps?.files === true)
+  const fail = async (step, error) => {
+    tombstone = await saveTombstone(prior.file, { ...tombstone, status: 'partial', failedStep: step, error: String(error?.message ?? error) })
+    throw new DeleteError(`Permanent deletion stopped during ${step}; retry is safe.`, 500, 'PARTIAL_DELETE', { step })
+  }
+  if (!tombstone.steps.files) try {
+    await assertInactive(ctx, id); await fs.rm(artifact.directory, { recursive: true, force: false }); ctx.sessionPersistence.coldLogMemo?.delete?.(id)
+    tombstone.steps.files = true; tombstone = await saveTombstone(prior.file, { ...tombstone, status: 'deleting', error: undefined })
+  } catch (error) { await fail('files', error) }
+  if (!tombstone.steps.projection) try {
+    await removeProjection(ctx.sessionProjectionCache, id); tombstone.steps.projection = true; tombstone = await saveTombstone(prior.file, tombstone)
+  } catch (error) { await fail('projection', error) }
+  if (!tombstone.steps.workspace) try {
+    await cleanWorkspace(ctx.workspaceRegistry, id); tombstone.steps.workspace = true; tombstone = await saveTombstone(prior.file, tombstone)
+  } catch (error) { await fail('workspace', error) }
+  tombstone = await saveTombstone(prior.file, { ...tombstone, status: 'complete', completedAt: new Date().toISOString(), error: undefined, failedStep: undefined })
+  ctx.emit('api-session/removed', id)
+  return { sessionId: id, status: tombstone.status }
+}
+
+export async function deleteSessionCore(ctx, rawId) {
+  const id = validateSessionId(rawId); const current = inFlight.get(id); if (current) return current
+  const operation = runDelete(ctx, id).finally(() => inFlight.delete(id)); inFlight.set(id, operation); return operation
+}
+
+function jsonResponse(status, value) {
+  return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } })
+}
+
+async function readRequestJson(request) {
   try {
-    const store = sessions.store
-    for (const variant of sessionIdVariants(sessionId)) {
-      const entry = store && typeof store.get === 'function' ? store.get(variant) : undefined
-      if (entry === undefined) continue
-      if (typeof sessions.detachEntered === 'function') {
-        sessions.detachEntered(entry)
-        detached = true
-      } else if (store && typeof store.delete === 'function') {
-        store.delete(variant)
-        if (sessions.attachments && entry.session && typeof sessions.attachments.delete === 'function') {
-          sessions.attachments.delete(entry.session)
-        }
-        detached = true
-      }
-    }
-  } catch { /* ignore */ }
-  return detached
+    const body = await request.json()
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error()
+    return body
+  } catch { throw new DeleteError('Invalid JSON body.', 400, 'INVALID_BODY') }
 }
 
-async function deleteSessionCore(ctx, sessionId) {
-  if (!SESSION_ID_RE.test(sessionId)) {
-    throw new DeleteError(`invalid session id: ${sessionId}`, 400)
-  }
-  const stopped = await stopAgentIfRunning(ctx, sessionId)
-  await flushSessionIfLive(ctx, sessionId)
-  const detached = detachLiveSession(ctx, sessionId)
-
-  // Remove every on-disk log directory first.  If the filesystem refuses, fail
-  // before touching workspace accounting so a half-deleted session cannot fall
-  // out of its group into "Ungrouped".
-  const firstDirRemoved = removeSessionDirs(sessionId)
-
-  // Remove projection rows now (they are not the grouping authority), then
-  // sweep again: the dispose path may have been mid-flight and could have
-  // re-created a directory after the first removal.
-  const projStorage = await stripStorageDomains(ctx, sessionId, { workspace: false })
-  const secondDirRemoved = removeSessionDirs(sessionId)
-  await new Promise((resolve) => setImmediate(resolve))
-  const thirdDirRemoved = removeSessionDirs(sessionId)
-
-  const remainingDirs = findSessionDirs(sessionId)
-  if (remainingDirs.length > 0) {
-    throw new DeleteError(`session files could not be fully removed: ${remainingDirs.join(', ')}`, 500)
-  }
-
-  // Only after the log is confirmed gone do we detach the session from its
-  // workspace/archive accounting.
-  const workspaceStorage = await stripStorageDomains(ctx, sessionId, { workspace: true })
-  const dirRemoved = firstDirRemoved || secondDirRemoved || thirdDirRemoved
-  const projRemoved = projStorage.projRemoved || workspaceStorage.projRemoved
-  const workspaceRemoved = workspaceStorage.workspaceRemoved
-  if (!dirRemoved && !projRemoved && !workspaceRemoved) {
-    throw new DeleteError(`session not found: ${sessionId}`, 404)
-  }
-  return { stopped, detached, dirRemoved, projRemoved, workspaceRemoved }
-}
-
-// --- session list (for sidebar menu title -> id matching) ----------------------
-
-// Lightweight {sessionId, title, running} list from the projection cache
-// (authoritative titles) plus the live agent registry. The client sidebar
-// menu item matches the row title against this list so it can open the
-// delete dialog for the right session WITHOUT switching to it.
-async function listSessions(ctx) {
-  const agents = ctx.get('agents')
-  const sd = ctx.get('storageDomain')
-  const out = []
-  if (!sd) return out
-  const proj = sd.get('session_projcache')
-  if (!proj || typeof proj.table !== 'function') return out
-  try {
-    const sessions = proj.table('sessions')
-    for (const [id, rec] of sessions.entries()) {
-      if (!rec || typeof rec !== 'object') continue
-      const rows = rec.rows && typeof rec.rows === 'object' ? rec.rows : {}
-      const titleRow = rows.title && rows.title.val
-      const identity = rec.identity && typeof rec.identity === 'object' ? rec.identity : {}
-      out.push({
-        sessionId: id,
-        title: typeof titleRow === 'string' ? titleRow : null,
-        createdAt: typeof identity.createdAt === 'number' ? identity.createdAt : null,
-        running: !!(agents && typeof agents.get === 'function' && agents.get(id)),
-      })
-    }
-  } catch { /* unit closed or table absent */ }
-  return out
-}
-
-// --- http helpers -------------------------------------------------------------
-
-function sendJson(res, status, obj) {
-  const body = JSON.stringify(obj)
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-  })
-  res.end(body)
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = ''
-    req.on('data', (d) => {
-      data += d
-      if (data.length > 1e6) req.destroy()
-    })
-    req.on('end', () => resolve(data))
-    req.on('error', reject)
-    req.on('aborted', () => reject(new Error('aborted')))
-  })
-}
-
-// --- plugin -------------------------------------------------------------------
-// webServer is OPTIONAL (a terminal-only profile has no web surface): the
-// HTTP endpoint registers when the service exists or appears later
-// (ctx.inject child), while the tool registers unconditionally — so the
-// plugin never hangs waiting on a service a profile will never provide.
-
-function apply(ctx) {
-  function registerHttp(host, targetCtx) {
-    targetCtx.effect(() => host.register({
-      kind: 'exact',
-      path: '/__chameleon/session/list',
-      handler: async (req, res) => {
-        if (req.method !== 'GET') {
-          sendJson(res, 405, { error: 'method not allowed' })
-          return
-        }
-        try {
-          sendJson(res, 200, { ok: true, sessions: await listSessions(ctx) })
-        } catch (e) {
-          sendJson(res, 500, { error: e.message })
-        }
-      },
-    }))
-
-    targetCtx.effect(() => host.register({
-      kind: 'exact',
-      path: '/__chameleon/session/delete',
-      handler: async (req, res) => {
-        if (req.method !== 'POST') {
-          sendJson(res, 405, { error: 'method not allowed' })
-          return
-        }
-        let args = {}
-        try {
-          const body = await readBody(req)
-          if (body) args = JSON.parse(body)
-        } catch {
-          sendJson(res, 400, { error: 'bad json body' })
-          return
-        }
-        const sessionId = String(args.sessionId || '').trim()
-        if (!sessionId) {
-          sendJson(res, 400, { error: 'sessionId required' })
-          return
-        }
-        try {
-          const result = await deleteSessionCore(ctx, sessionId)
-          sendJson(res, 200, { ok: true, removed: [sessionId], ...result })
-        } catch (e) {
-          const status = e instanceof DeleteError && e.status ? e.status : 500
-          sendJson(res, status, { error: e.message })
-        }
-      },
-    }))
-  }
-
-  const ws = ctx.get('webServer')
-  if (ws !== undefined) {
-    registerHttp(ws, ctx)
-  } else {
-    // Register the route once a web surface appears (never in terminal-only
-    // profiles); the child fiber is torn down with this plugin's context.
-    ctx.inject(['webServer'], (sub) => {
-      registerHttp(sub.webServer, sub)
-    })
-  }
-
-  ctx.tools.register(defineTool({
-    name: 'workbench_session_delete',
-    description: 'Permanently delete one session of this workbench: stops the agent if it is running (cancel + quiescence), then removes its persisted log, projection-cache row and workspace accounting. After deletion the client reloads; the edit-mode caller should verify with workbench_status or the session list.',
-    parameters: {
-      sessionId: {
-        type: 'string',
-        required: true,
-        description: 'The session id to delete (uuid or session-<uuid> form).',
-      },
-    },
-    output: {
-      schema: { type: 'string' },
-      render(_args, value) { return [{ type: 'text', text: value }] },
-    },
-    async execute(args) {
-      const sessionId = String(args.sessionId || '').trim()
+export function apply(ctx) {
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: API_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
       try {
-        const result = await deleteSessionCore(ctx, sessionId)
-        return [
-          `deleted: ${sessionId}`,
-          `log dir removed: ${result.dirRemoved}`,
-          `projection row removed: ${result.projRemoved}`,
-          `workspace accounting removed: ${result.workspaceRemoved}`,
-        ].join('\n')
-      } catch (e) {
-        return `delete failed: ${e.message}`
+        if (request.headers.get(CSRF_HEADER) !== CSRF_VALUE) throw new DeleteError('Missing plugin request header.', 403, 'FORBIDDEN')
+        const body = await readRequestJson(request)
+        return jsonResponse(200, { ok: true, data: await deleteSessionCore(ctx, body.sessionId) })
+      } catch (error) {
+        return jsonResponse(error?.status ?? 500, { ok: false, error: { code: error?.code ?? 'DELETE_FAILED', message: error?.message ?? String(error), details: error?.details } })
       }
     },
-  }))
+  }), 'gunthe-session-delete: authenticated delete route')
 }
-
-export { apply, inject, name }

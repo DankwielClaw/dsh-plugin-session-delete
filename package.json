@@ -1,42 +1,29 @@
 {
-  "name": "@huanlin/dsh-plugin-session-delete",
-  "version": "0.3.1",
-  "description": "Delete sessions of a DeepSeek Harness profile from the UI: header danger button + session-row menu item with a risk-consent dialog; host endpoint + tool delete the log, projection cache and workspace accounting. Works in web and the desktop client alike.",
+  "name": "@dankwielclaw/dsh-plugin-session-delete",
+  "version": "1.0.0",
+  "description": "Gunthe 0.2 session permanent-delete action with exact-ID targeting and confirmation.",
   "type": "module",
   "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
-  "keywords": ["dsh-plugin"],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/lsz-asd/dsh-plugin-session-delete.git"
-  },
-  "files": [
-    "src/",
-    "cordis.patch.yml"
-  ],
-  "engines": {
-    "node": ">=20"
-  },
+  "repository": "https://github.com/DankwielClaw/dsh-plugin-session-delete",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
     "./client": "./src/client.js",
     "./package.json": "./package.json"
   },
+  "files": ["src/", "test/", "cordis.patch.yml"],
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test test/*.test.js" },
   "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
+    "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
-      "inject": [
-        "@deepseek-ai/dsh-client-runtime"
-      ],
-      "platform": "web"
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-workspace", "@deepseek-ai/dsh-client-ui-primitives"]
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-projection-cache": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-workspace": "0.2.0-rc.2"
   }
 }
