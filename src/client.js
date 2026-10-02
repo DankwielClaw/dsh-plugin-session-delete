@@ -32,15 +32,19 @@ window.__ModuleLoader__.load({
     function DeleteMenuItem(props) {
       const [, setMenuOpen] = props.useMenuOpenState ? props.useMenuOpenState() : [false, () => {}]
       const source = props.ctx.workspaces.list
-      const archived = React.useSyncExternalStore(
+      React.useSyncExternalStore(
         (listener) => source.subscribe(listener),
-        () => source.getSnapshot().archivedSessionIds.includes(props.sessionId),
+        () => source.getSnapshot(),
       )
-      if (!archived) return null
       return h(MenuItemButton, {
         icon: h(IconTrashOutline16, { size: 14 }),
         onSelect: () => {
           setMenuOpen(false)
+          const archived = source.getSnapshot().archivedSessionIds.includes(props.sessionId)
+          if (!archived) {
+            window.alert(lang() === 'zh' ? '請先 Archive 呢個 Session，再喺 Archived 清單永久刪除。' : 'Archive this session first, then permanently delete it from the Archived list.')
+            return
+          }
           openDialog(props.sessionId, props.displayTitle)
         },
         danger: true,
